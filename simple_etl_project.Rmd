@@ -1,0 +1,180 @@
+---
+title: "Simple ETL Pipeline in R"
+author: "by Kolapo Obajuluwa"
+date: "2/12/2022"
+output: html_document
+---
+
+## Create an ETL Pipeline in 10 minutes with R
+
+Hi! How's it going? I'm well too, thanks for asking! It's been too long since my last post, why? Let's just thank God for love and life. 
+
+This will be a short read (at least I hope it will), mostly because it's a mirror post. Let me explain.
+
+I came across an interesting medium post by Nazia Habib (huge shoutout) where he detailed how to [create a simple ETL pipeline in python](https://towardsdev.com/create-an-etl-pipeline-in-python-with-pandas-in-10-minutes-6be436483ec9).  I recommend quickly going through it as I shall try to avoid repeating anything he discussed there.
+
+My goal after reading his post was to replicate it but in R, so the following details how I achieved that.
+
+For some context (as I suspect you may not have checked out his post), the aim is to query movie data from the tmdb API, transform the data, extract three tables (movies, genres list and datetimes) and load them into a desired location/format (Excel Workbook for me and csvs for Nazia). Really, this could go into a database, data warehouse, google sheets or whatever destination you please but for simplicity, an Excel workbook works just fine for me now.
+
+To skip the explanation and view the full commented source code, [click here]().
+
+## Getting Started
+
+Caution! No for loops were used in the making of this post.
+
+Nazia already explains how to acquire an access key from the tmdb API so I'll just skip ahead to loading the key and importing relevant libraries
+
+```{r, warning=FALSE}
+# import libraries
+pacman::p_load(jsonlite, tidyverse, glue, httr)
+
+# load api_key from config.json file
+key <- read_json("config.json")
+```
+
+## Extract
+
+Data is queried from our API by movie_id, an integer. To query a single data point, we just call the url with the desired movie_id and our API key as shown below
+
+```{r}
+
+movie_id <- 500
+
+url <- paste0('https://api.themoviedb.org/3/movie/',movie_id,'?api_key=',key$api_key,'&language=en-US')
+
+response <- GET(url)
+
+```
+
+Now let's get data for a range of movies, say movies with ids from 560 to 565.
+
+To do this, we first declare our range of IDs. Next, using the glue function, we generate a vector (list) of urls with each ID and our api_key.
+
+```{r}
+# declare target movie ids
+movie_id <- 560:565
+
+# create vector of urls with movie ids and api_key
+url_list <- glue('https://api.themoviedb.org/3/movie/{movie_id}?api_key={key$api_key}&language=en-US')
+```
+
+Next, we write a function to query each url, extract the required data and return our desired response. This is done by customizing our GET function to further filter for the desired content.
+
+```{r}
+# customize GET function to extract content, parse from raw to CHar and extract JSON
+customGET <- function (url) {
+  response <- GET(url)
+  res <- response$content %>%
+    rawToChar() %>%
+    fromJSON()
+
+  return(res)
+}
+```
+
+After verifying that our function works, we can vectorize it with the iterative argument being the url. We do this to enable R loop through the url_list efficently and return a list of responses to us ready to be bound into a dataframe.
+
+```{r}
+# vectorize customGET function to easily call urls from url_list
+vCustomGET <- Vectorize(customGET, vectorize.args = "url")
+
+# call urls from url_list
+response_list <- vCustomGET(url = url_list)
+
+# convert response to dataframe
+df <- as.data.frame(t(rbind(response_list)))
+```
+
+## Transform
+
+Next we want to select only the columns we're interested in and unnnest them as they're still named lists.
+We'll address the 'genres' column in a bit.
+
+```{r}
+# declare relevant headers
+df_columns <- c('budget', 'id', 'imdb_id', 'original_title', 'release_date', 'revenue', 'runtime', 'genres')
+
+# select desired headers and unnest all except genres
+df <- df %>%
+  select(all_of(df_columns)) %>%
+  rename('movie_id' = 'id') %>%
+  unnest(cols = -c(genres))
+
+# visualize our dataframe (finally)
+df
+```
+
+To create the genres table, we pull our 'genres' column and extract all unique genres into a table as shown below.
+
+```{r}
+# create table of unique genre name and id
+genres_df <- df %>% select(genres) %>% pull() %>% Reduce(rbind, .) %>% data.frame() %>% unique()
+
+# visualize
+genres_df
+
+```
+
+For our main movies table, we want to be able to filter through the genres easily such that if a movie belongs to a genre, it has a row value of 1 and if not, the value is 0.
+
+To do this, we unnest the 'genres' column and pivot_wider (spread) the column with column names as each unique genre and values as the id (genre id). We then run a simple custom function (serializer_fn) to replace all values in the genre columns with 1 or 0 depending on whether or not they exist (are not NA).
+
+```{r}
+
+# create funtion to serialize genre columns
+serializer_fn <- function(x) {
+  if_else(!is.na(x), 1, 0)
+}
+
+# unnest genre column and serialize
+df <- df %>%
+  unnest(genres) %>%
+  pivot_wider(names_from = name, values_from = id, values_fn = serializer_fn, values_fill = 0)
+
+# visualize\
+df
+```
+
+For the last table, the datetime table, using the lubridate package, we can easily extract the day, month, year and day_of_week from the release_date column.
+
+```{r}
+# create datetime  table
+datetime_df <- df %>%
+  select(movie_id, release_date) %>%
+  mutate(release_date= lubridate::ymd(release_date),
+         day = as.numeric(format(release_date, "%d")),
+         month = as.numeric(format(release_date, "%m")),
+         year = as.numeric(format(release_date, "%Y")),
+         day_of_week = format(release_date, "%A"),
+         )
+
+# visualise
+datetime_df
+
+```
+
+## Load
+
+All three tables are created and ready to be loaded into our Excel Workbook destination. This file will be created in our working directory. 
+
+```{r}
+# load data to desired location (excel spreadsheet this time)
+library(writexl)
+
+# assign each table to a separate worksheet
+export_list <- list(
+  'tmdb_movies' = df,
+  'genres' = genres_df,
+  'tmdb_datetimes' = datetime_df
+)
+
+# write to xlsx file
+writexl::write_xlsx(export_list, 'tmdb_export.xlsx')
+```
+
+Well this has been fun! Thanks for reading this far! My argument for writing ETL scripts in R would be that translating my intention of data transformation is more intuitive in R than in python but hey! do what works for you!
+
+Have a great one and feel free to leave comments and/or questions.
+
+Also connect with me on [LinkedIn](https://www.linkedin.com/in/kolapo-obajuluwa-562978a5/) to collaborate on projects and talk about data in all flavors!
